@@ -80,7 +80,7 @@ jobs:
           SKIP: "pg_hint_plan-src,pg_repack-src,pg_cron-src,plpgsql_check-src"
 
       - name: Delete Neon Project
-        if: ${{ always() }}
+#       if: ${{ always() }}
         uses: ./.github/actions/neon-project-delete
         with:
           project_id: ${{ steps.create-neon-project.outputs.project_id }}
