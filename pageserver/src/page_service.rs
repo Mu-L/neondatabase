@@ -2,18 +2,20 @@
 //! requests.
 
 use std::borrow::Cow;
+use std::net::SocketAddr;
 use std::num::NonZeroUsize;
 use std::os::fd::AsRawFd;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 use std::{io, str};
 
-use crate::PERF_TRACE_TARGET;
+use crate::{CancellableTask, PERF_TRACE_TARGET};
 use anyhow::{Context, bail};
 use async_compression::tokio::write::GzipEncoder;
 use bytes::Buf;
-use futures::FutureExt;
+use futures::{FutureExt, Stream};
 use itertools::Itertools;
 use jsonwebtoken::TokenData;
 use once_cell::sync::OnceCell;
@@ -31,6 +33,7 @@ use pageserver_api::models::{
 };
 use pageserver_api::reltag::SlruKind;
 use pageserver_api::shard::TenantShardId;
+use pageserver_page_api::proto;
 use postgres_backend::{
     AuthType, PostgresBackend, PostgresBackendReader, QueryError, is_expected_io_error,
 };
@@ -135,6 +138,54 @@ pub fn spawn(
     ));
 
     Listener { cancel, task }
+}
+
+pub fn spawn_grpc(
+    conf: &'static PageServerConf,
+    tenant_manager: Arc<TenantManager>,
+    auth: Option<Arc<SwappableJwtAuth>>,
+    perf_trace_dispatch: Option<Dispatch>,
+    addr: SocketAddr,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
+) -> CancellableTask {
+    let cancel = CancellationToken::new();
+    let ctx = RequestContextBuilder::new(TaskKind::PageRequestHandler)
+        .download_behavior(DownloadBehavior::Download)
+        .perf_span_dispatch(perf_trace_dispatch)
+        .detached_child();
+    let gate = Gate::default();
+
+    let perf_span_fields = ConnectionPerfSpanFields {
+        peer_addr: "".to_string(), // TODO
+        application_name: None,    // filled in later
+        compute_mode: None,        // filled in later
+    };
+
+    let handler = PageServerHandler::new(
+        conf,
+        tenant_manager,
+        auth,
+        conf.page_service_pipelining.clone(),
+        perf_span_fields,
+        ctx,
+        cancel.clone(),
+        gate.enter().unwrap(),
+    );
+
+    let mut server = tonic::transport::Server::builder();
+    let server = server.add_service(proto::PageServiceServer::new(handler));
+
+    let task_cancel = cancel.clone();
+    let task = COMPUTE_REQUEST_RUNTIME.spawn(task_mgr::exit_on_panic_or_error(
+        "grpc listener",
+        async move {
+            server
+                .serve_with_shutdown(addr, task_cancel.cancelled())
+                .await
+        },
+    ));
+
+    CancellableTask { task, cancel }
 }
 
 impl Listener {
@@ -838,6 +889,58 @@ impl BatchedFeMessage {
             }
             (_, _) => Some(GetPageBatchBreakReason::NonBatchableRequest),
         }
+    }
+}
+
+/// Implements the page service over gRPC.
+#[tonic::async_trait]
+impl proto::PageService for PageServerHandler {
+    type GetBaseBackupStream = Pin<
+        Box<dyn Stream<Item = Result<proto::GetBaseBackupResponseChunk, tonic::Status>> + Send>,
+    >;
+    type GetPagesStream =
+        Pin<Box<dyn Stream<Item = Result<proto::GetPageResponse, tonic::Status>> + Send>>;
+
+    async fn check_rel_exists(
+        &self,
+        _: tonic::Request<proto::CheckRelExistsRequest>,
+    ) -> Result<tonic::Response<proto::CheckRelExistsResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not implemented"))
+    }
+
+    async fn get_base_backup(
+        &self,
+        _: tonic::Request<proto::GetBaseBackupRequest>,
+    ) -> Result<tonic::Response<Self::GetBaseBackupStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not implemented"))
+    }
+
+    async fn get_db_size(
+        &self,
+        _: tonic::Request<proto::GetDbSizeRequest>,
+    ) -> Result<tonic::Response<proto::GetDbSizeResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not implemented"))
+    }
+
+    async fn get_pages(
+        &self,
+        _: tonic::Request<tonic::Streaming<proto::GetPageRequest>>,
+    ) -> Result<tonic::Response<Self::GetPagesStream>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not implemented"))
+    }
+
+    async fn get_rel_size(
+        &self,
+        _: tonic::Request<proto::GetRelSizeRequest>,
+    ) -> Result<tonic::Response<proto::GetRelSizeResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not implemented"))
+    }
+
+    async fn get_slru_segment(
+        &self,
+        _: tonic::Request<proto::GetSlruSegmentRequest>,
+    ) -> Result<tonic::Response<proto::GetSlruSegmentResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not implemented"))
     }
 }
 

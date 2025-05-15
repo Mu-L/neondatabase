@@ -748,7 +748,7 @@ fn start_pageserver(
     let page_service = page_service::spawn(
         conf,
         tenant_manager.clone(),
-        pg_auth,
+        pg_auth.clone(),
         perf_trace_dispatch,
         {
             let _entered = COMPUTE_REQUEST_RUNTIME.enter(); // TcpListener::from_std requires it
@@ -758,12 +758,31 @@ fn start_pageserver(
             tokio::net::TcpListener::from_std(pageserver_listener)
                 .context("create tokio listener")?
         },
-        if conf.enable_tls_page_service_api {
-            tls_server_config
-        } else {
-            None
-        },
+        conf.enable_tls_page_service_api
+            .then(|| tls_server_config.clone())
+            .flatten(),
     );
+
+    // Spawn a task to listen for Pageserver gRPC connections. It will spawn
+    // further tasks for each stream/request.
+    //
+    // TODO: this uses a separate port and runtime for the page service. If we
+    // want other gRPC services, they will need their own port and runtime. Is
+    // this necessary?
+    let grpc_addr = "127.0.0.1:9999".parse()?;
+    let page_service_grpc = page_service::spawn_grpc(
+        conf,
+        tenant_manager.clone(),
+        pg_auth.clone(),
+        otel_guard.as_ref().map(|g| g.dispatch.clone()),
+        grpc_addr,
+        conf.enable_tls_page_service_api
+            .then(|| tls_server_config.clone())
+            .flatten(),
+    );
+
+    // Spawn a gRPC server. It will spawn further tasks for each request.
+    tonic::transport::Server::builder();
 
     // All started up! Now just sit and wait for shutdown signal.
     BACKGROUND_RUNTIME.block_on(async move {
@@ -783,6 +802,7 @@ fn start_pageserver(
             http_endpoint_listener,
             https_endpoint_listener,
             page_service,
+            Some(page_service_grpc),
             consumption_metrics_tasks,
             disk_usage_eviction_task,
             &tenant_manager,
