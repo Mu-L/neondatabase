@@ -14,7 +14,7 @@ use std::{
 use pin_list::PinList;
 use scopeguard::ScopeGuard;
 
-trait QueueProcessing: UnwindSafe + Send + 'static {
+pub trait QueueProcessing: UnwindSafe + Send + 'static {
     type Req: Send + 'static;
     type Res: Send;
 
@@ -43,11 +43,22 @@ impl<P: QueueProcessing> QueueProcessing for AssertUnwindSafe<P> {
     }
 }
 
-struct BatchQueue<P: QueueProcessing> {
+pub struct BatchQueue<P: QueueProcessing> {
     inner: Mutex<BatchQueueInner<P>>,
 }
 
 impl<P: QueueProcessing> BatchQueue<P> {
+    pub fn new(p: P) -> Self {
+        Self {
+            inner: Mutex::new(BatchQueueInner {
+                processor: Some(p),
+                version: 0,
+                queue: PinList::new(pin_list::id::Checked::new()),
+                len: 0,
+            }),
+        }
+    }
+
     pub async fn call(self: &Arc<Self>, req: P::Req) -> P::Res {
         let node = pin!(pin_list::Node::<BatchQueueTypes<P>>::new());
         let mut node = self.initialise_node(node, req);
