@@ -30,7 +30,6 @@ use crate::tls::postgres_rustls::MakeRustlsConnect;
 type IpSubnetKey = IpNet;
 
 const CANCEL_KEY_TTL: i64 = 1_209_600; // 2 weeks cancellation key expire time
-const REDIS_SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(10);
 const BATCH_SIZE: usize = 8;
 
 // Message types for sending through mpsc channel
@@ -39,7 +38,6 @@ pub enum CancelKeyOp {
         key: String,
         field: String,
         value: String,
-        resp_tx: Option<oneshot::Sender<anyhow::Result<()>>>,
         _guard: CancelChannelSizeGuard<'static>,
         expire: i64, // TTL for key
     },
@@ -51,7 +49,6 @@ pub enum CancelKeyOp {
     RemoveCancelKey {
         key: String,
         field: String,
-        resp_tx: Option<oneshot::Sender<anyhow::Result<()>>>,
         _guard: CancelChannelSizeGuard<'static>,
     },
 }
@@ -109,13 +106,6 @@ impl Pipeline {
     fn add_command_no_reply(&mut self, cmd: Cmd) {
         self.inner.add_command(cmd).ignore();
     }
-
-    fn add_command(&mut self, cmd: Cmd, reply: Option<CancelReplyOp>) {
-        match reply {
-            Some(reply) => self.add_command_with_reply(cmd, reply),
-            None => self.add_command_no_reply(cmd),
-        }
-    }
 }
 
 impl CancelKeyOp {
@@ -126,13 +116,10 @@ impl CancelKeyOp {
                 key,
                 field,
                 value,
-                resp_tx,
                 _guard,
                 expire,
             } => {
-                let reply =
-                    resp_tx.map(|resp_tx| CancelReplyOp::StoreCancelKey { resp_tx, _guard });
-                pipe.add_command(Cmd::hset(&key, field, value), reply);
+                pipe.add_command_no_reply(Cmd::hset(&key, field, value));
                 pipe.add_command_no_reply(Cmd::expire(key, expire));
             }
             CancelKeyOp::GetCancelData {
@@ -143,15 +130,8 @@ impl CancelKeyOp {
                 let reply = CancelReplyOp::GetCancelData { resp_tx, _guard };
                 pipe.add_command_with_reply(Cmd::hgetall(key), reply);
             }
-            CancelKeyOp::RemoveCancelKey {
-                key,
-                field,
-                resp_tx,
-                _guard,
-            } => {
-                let reply =
-                    resp_tx.map(|resp_tx| CancelReplyOp::RemoveCancelKey { resp_tx, _guard });
-                pipe.add_command(Cmd::hdel(key, field), reply);
+            CancelKeyOp::RemoveCancelKey { key, field, _guard } => {
+                pipe.add_command_no_reply(Cmd::hdel(key, field));
             }
         }
     }
@@ -159,16 +139,8 @@ impl CancelKeyOp {
 
 // Message types for sending through mpsc channel
 pub enum CancelReplyOp {
-    StoreCancelKey {
-        resp_tx: oneshot::Sender<anyhow::Result<()>>,
-        _guard: CancelChannelSizeGuard<'static>,
-    },
     GetCancelData {
         resp_tx: oneshot::Sender<anyhow::Result<Vec<(String, String)>>>,
-        _guard: CancelChannelSizeGuard<'static>,
-    },
-    RemoveCancelKey {
-        resp_tx: oneshot::Sender<anyhow::Result<()>>,
         _guard: CancelChannelSizeGuard<'static>,
     },
 }
@@ -176,19 +148,7 @@ pub enum CancelReplyOp {
 impl CancelReplyOp {
     fn send_err(self, e: anyhow::Error) {
         match self {
-            CancelReplyOp::StoreCancelKey { resp_tx, _guard } => {
-                resp_tx
-                    .send(Err(e))
-                    .inspect_err(|_| tracing::debug!("could not send reply"))
-                    .ok();
-            }
             CancelReplyOp::GetCancelData { resp_tx, _guard } => {
-                resp_tx
-                    .send(Err(e))
-                    .inspect_err(|_| tracing::debug!("could not send reply"))
-                    .ok();
-            }
-            CancelReplyOp::RemoveCancelKey { resp_tx, _guard } => {
                 resp_tx
                     .send(Err(e))
                     .inspect_err(|_| tracing::debug!("could not send reply"))
@@ -199,23 +159,7 @@ impl CancelReplyOp {
 
     fn send_value(self, v: redis::Value) {
         match self {
-            CancelReplyOp::StoreCancelKey { resp_tx, _guard } => {
-                let send =
-                    FromRedisValue::from_owned_redis_value(v).context("could not parse value");
-                resp_tx
-                    .send(send)
-                    .inspect_err(|_| tracing::debug!("could not send reply"))
-                    .ok();
-            }
             CancelReplyOp::GetCancelData { resp_tx, _guard } => {
-                let send =
-                    FromRedisValue::from_owned_redis_value(v).context("could not parse value");
-                resp_tx
-                    .send(send)
-                    .inspect_err(|_| tracing::debug!("could not send reply"))
-                    .ok();
-            }
-            CancelReplyOp::RemoveCancelKey { resp_tx, _guard } => {
                 let send =
                     FromRedisValue::from_owned_redis_value(v).context("could not parse value");
                 resp_tx
@@ -367,12 +311,7 @@ impl CancellationHandler {
             return Err(CancelError::InternalError);
         };
 
-        tx.send_timeout(op, REDIS_SEND_TIMEOUT)
-            .await
-            .map_err(|e| {
-                tracing::warn!("failed to send GetCancelData for {key}: {e}");
-            })
-            .map_err(|()| CancelError::InternalError)?;
+        tx.send(op).await.map_err(|_| CancelError::InternalError)?;
 
         let result = resp_rx.await.map_err(|e| {
             tracing::warn!("failed to receive GetCancelData response: {e}");
@@ -406,6 +345,7 @@ impl CancellationHandler {
         };
         Ok(cancel_state)
     }
+
     /// Try to cancel a running query for the corresponding connection.
     /// If the cancellation key is not found, it will be published to Redis.
     /// check_allowed - if true, check if the IP is allowed to cancel the query.
@@ -570,7 +510,7 @@ impl Session {
     }
 
     // Send the store key op to the cancellation handler and set TTL for the key
-    pub(crate) async fn write_cancel_key(
+    pub(crate) fn write_cancel_key(
         &self,
         cancel_closure: CancelClosure,
     ) -> Result<(), CancelError> {
@@ -588,7 +528,6 @@ impl Session {
             key: self.redis_key.clone(),
             field: "data".to_string(),
             value: closure_json,
-            resp_tx: None,
             _guard: Metrics::get()
                 .proxy
                 .cancel_channel_size
@@ -596,7 +535,7 @@ impl Session {
             expire: CANCEL_KEY_TTL,
         };
 
-        let _ = tx.send_timeout(op, REDIS_SEND_TIMEOUT).await.map_err(|e| {
+        let _ = tx.try_send(op).map_err(|e| {
             let key = self.key;
             tracing::warn!("failed to send StoreCancelKey for {key}: {e}");
         });
@@ -612,17 +551,13 @@ impl Session {
         let op = CancelKeyOp::RemoveCancelKey {
             key: self.redis_key.clone(),
             field: "data".to_string(),
-            resp_tx: None,
             _guard: Metrics::get()
                 .proxy
                 .cancel_channel_size
                 .guard(RedisMsgKind::HDel),
         };
 
-        let _ = tx.send_timeout(op, REDIS_SEND_TIMEOUT).await.map_err(|e| {
-            let key = self.key;
-            tracing::warn!("failed to send RemoveCancelKey for {key}: {e}");
-        });
+        tx.send(op).await.map_err(|_| CancelError::InternalError)?;
         Ok(())
     }
 }
