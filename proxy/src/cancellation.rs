@@ -38,10 +38,8 @@ const BATCH_SIZE: usize = 8;
 pub enum CancelKeyOp {
     StoreCancelKey {
         key: String,
-        field: String,
         value: String,
         _guard: CancelChannelSizeGuard<'static>,
-        expire: i64, // TTL for key
     },
     GetCancelData {
         key: String,
@@ -100,18 +98,12 @@ impl Pipeline {
 }
 
 impl CancelKeyOp {
-    fn register(self, pipe: &mut Pipeline) {
+    fn register(&self, pipe: &mut Pipeline) {
         #[allow(clippy::used_underscore_binding)]
         match self {
-            CancelKeyOp::StoreCancelKey {
-                key,
-                field,
-                value,
-                _guard,
-                expire,
-            } => {
-                pipe.add_command_with_reply(Cmd::hset(&key, field, value));
-                pipe.add_command_no_reply(Cmd::expire(key, expire));
+            CancelKeyOp::StoreCancelKey { key, value, _guard } => {
+                pipe.add_command_with_reply(Cmd::hset(key, "data", value));
+                pipe.add_command_no_reply(Cmd::expire(key, CANCEL_KEY_TTL.as_secs() as i64));
             }
             CancelKeyOp::GetCancelData { key, _guard } => {
                 pipe.add_command_with_reply(Cmd::hgetall(key));
@@ -134,7 +126,7 @@ impl QueueProcessing for RedisKVClient {
         let batch_size = batch.len();
         debug!(batch_size, "running cancellation jobs");
 
-        for msg in batch {
+        for msg in &batch {
             msg.register(&mut pipeline);
         }
 
@@ -468,13 +460,11 @@ impl Session {
         loop {
             let op = CancelKeyOp::StoreCancelKey {
                 key: self.redis_key.clone(),
-                field: "data".to_string(),
                 value: closure_json.clone(),
                 _guard: Metrics::get()
                     .proxy
                     .cancel_channel_size
                     .guard(RedisMsgKind::HSet),
-                expire: CANCEL_KEY_TTL.as_secs() as i64,
             };
 
             if tx.call(op).await.is_ok() {
